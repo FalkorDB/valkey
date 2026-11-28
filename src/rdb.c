@@ -77,6 +77,8 @@
 /* This macro tells if we are in the context of a RESTORE command, and not loading an RDB or AOF. */
 #define isRestoreContext() ((server.current_client == NULL || server.current_client->id == CLIENT_ID_AOF) ? 0 : 1)
 
+static unsigned long long rdb_stream_idmp_discarded_count;
+
 char *rdbFileBeingLoaded = NULL; /* used for rdb checking on read error */
 extern int rdbCheckMode;
 void rdbCheckError(const char *fmt, ...);
@@ -387,7 +389,7 @@ int rdbEncodeInteger(long long value, unsigned char *enc) {
 /* Loads an integer-encoded object with the specified encoding type "enctype".
  * The returned value changes according to the flags, see
  * rdbGenericLoadStringObject() for more info. */
-void *rdbLoadIntegerObject(rio *rdb, int enctype, int flags, size_t *lenptr) {
+static void *rdbLoadIntegerObject(rio *rdb, int enctype, int flags, size_t *lenptr, bool *allocation_error) {
     int plain = flags & RDB_LOAD_PLAIN;
     int sds = flags & RDB_LOAD_SDS;
     int encode = flags & RDB_LOAD_ENC;
@@ -415,7 +417,15 @@ void *rdbLoadIntegerObject(rio *rdb, int enctype, int flags, size_t *lenptr) {
         char buf[LONG_STR_SIZE], *p;
         int len = ll2string(buf, sizeof(buf), val);
         if (lenptr) *lenptr = len;
-        p = plain ? zmalloc(len) : sdsnewlen(SDS_NOINIT, len);
+        if (allocation_error) {
+            p = plain ? ztrymalloc(len) : sdstrynewlen(SDS_NOINIT, len);
+            if (!p) {
+                *allocation_error = true;
+                return NULL;
+            }
+        } else {
+            p = plain ? zmalloc(len) : sdsnewlen(SDS_NOINIT, len);
+        }
         memcpy(p, buf, len);
         return p;
     } else if (encode) {
@@ -482,16 +492,21 @@ ssize_t rdbSaveLzfStringObject(rio *rdb, unsigned char *s, size_t len) {
 /* Load an LZF compressed string in RDB format. The returned value
  * changes according to 'flags'. For more info check the
  * rdbGenericLoadStringObject() function. */
-void *rdbLoadLzfStringObject(rio *rdb, int flags, size_t *lenptr) {
+void *rdbLoadLzfStringObject(rio *rdb,
+                             int flags,
+                             size_t *lenptr,
+                             bool *allocation_error) {
     int plain = flags & RDB_LOAD_PLAIN;
     int sds = flags & RDB_LOAD_SDS;
     uint64_t len, clen;
     unsigned char *c = NULL;
     char *val = NULL;
 
+    if (allocation_error) *allocation_error = false;
     if ((clen = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
     if ((len = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
     if ((c = ztrymalloc(clen)) == NULL) {
+        if (allocation_error) *allocation_error = true;
         serverLog(isRestoreContext() ? LL_VERBOSE : LL_WARNING, "rdbLoadLzfStringObject failed allocating %llu bytes",
                   (unsigned long long)clen);
         goto err;
@@ -504,6 +519,7 @@ void *rdbLoadLzfStringObject(rio *rdb, int flags, size_t *lenptr) {
         val = sdstrynewlen(SDS_NOINIT, len);
     }
     if (!val) {
+        if (allocation_error) *allocation_error = true;
         serverLog(isRestoreContext() ? LL_VERBOSE : LL_WARNING, "rdbLoadLzfStringObject failed allocating %llu bytes",
                   (unsigned long long)len);
         goto err;
@@ -614,12 +630,16 @@ ssize_t rdbSaveStringObject(rio *rdb, robj *obj) {
  *
  * On I/O error NULL is returned.
  */
-void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
+static void *rdbGenericLoadStringObjectWithError(rio *rdb,
+                                                 int flags,
+                                                 size_t *lenptr,
+                                                 bool *allocation_error) {
     int plain = flags & RDB_LOAD_PLAIN;
     int sds = flags & RDB_LOAD_SDS;
     int isencoded;
     unsigned long long len;
 
+    if (allocation_error) *allocation_error = false;
     len = rdbLoadLen(rdb, &isencoded);
     if (len == RDB_LENERR) return NULL;
 
@@ -627,8 +647,8 @@ void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
         switch (len) {
         case RDB_ENC_INT8:
         case RDB_ENC_INT16:
-        case RDB_ENC_INT32: return rdbLoadIntegerObject(rdb, len, flags, lenptr);
-        case RDB_ENC_LZF: return rdbLoadLzfStringObject(rdb, flags, lenptr);
+        case RDB_ENC_INT32: return rdbLoadIntegerObject(rdb, len, flags, lenptr, allocation_error);
+        case RDB_ENC_LZF: return rdbLoadLzfStringObject(rdb, flags, lenptr, allocation_error);
         default: rdbReportCorruptRDB("Unknown RDB string encoding type %llu", len); return NULL;
         }
     }
@@ -636,6 +656,7 @@ void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
     if (plain || sds) {
         void *buf = plain ? ztrymalloc(len) : sdstrynewlen(SDS_NOINIT, len);
         if (!buf) {
+            if (allocation_error) *allocation_error = true;
             serverLog(isRestoreContext() ? LL_VERBOSE : LL_WARNING,
                       "rdbGenericLoadStringObject failed allocating %llu bytes", len);
             return NULL;
@@ -652,6 +673,7 @@ void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
     } else {
         robj *o = tryCreateStringObject(SDS_NOINIT, len);
         if (!o) {
+            if (allocation_error) *allocation_error = true;
             serverLog(isRestoreContext() ? LL_VERBOSE : LL_WARNING,
                       "rdbGenericLoadStringObject failed allocating %llu bytes", len);
             return NULL;
@@ -662,6 +684,10 @@ void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
         }
         return o;
     }
+}
+
+void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
+    return rdbGenericLoadStringObjectWithError(rdb, flags, lenptr, NULL);
 }
 
 robj *rdbLoadStringObject(rio *rdb) {
@@ -803,12 +829,12 @@ int rdbGetObjectType(robj *o, int rdbver) {
     return -1; /* avoid warning */
 }
 
-/* Use rdbLoadType() to load a TYPE in RDB format, but returns -1 if the
- * type is not specifically a valid Object Type. */
-int rdbLoadObjectType(rio *rdb) {
+/* Use rdbLoadType() to load an object type, accepting foreign types only in
+ * their own version namespace. Return -1 for an unsupported object type. */
+int rdbLoadObjectType(rio *rdb, int rdbver) {
     int type;
     if ((type = rdbLoadType(rdb)) == -1) return -1;
-    if (!rdbIsObjectType(type)) return -1;
+    if (!rdbIsObjectType(type) && !rdbIsSupportedForeignType(rdbver, type)) return -1;
     return type;
 }
 
@@ -1326,7 +1352,10 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
 
     /* Save the LFU info. */
     if (savelfu) {
-        uint8_t freq = objectGetLFUFrequency(val);
+        /* Read without maintaining the LFU value.  A forkless save runs this on
+         * a background thread, and for a forked save, modification would create
+         * additional CoW pressure. */
+        uint8_t freq = objectGetLFUFrequencyReadOnly(val);
         /* We can encode this in exactly two bytes: the opcode and an 8
          * bit counter, since the frequency is logarithmic with a 0-255 range.
          * Note that we do not store the halving time because to reset it
@@ -1584,7 +1613,6 @@ werr:
  * error. */
 static int rdbSaveRioInternal(int req, int rdbver, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
     long key_counter = 0;
-    int j;
 
     if (rdbWriteHeader(rdb, req, rdbver, rdbflags, rsi) == C_ERR) goto werr;
 
@@ -1593,8 +1621,9 @@ static int rdbSaveRioInternal(int req, int rdbver, rio *rdb, int *error, int rdb
         /* RDB slot import info is encoded in a required opcode since exposing
          * importing slots is a consistency problem. */
         if (clusterRDBSaveSlotImports(rdb, rdbver) == C_ERR) goto werr;
-        for (j = 0; j < server.dbnum; j++) {
-            if (rdbSaveDb(rdb, j, rdbflags, rdbver, &key_counter) == -1) goto werr;
+        serverDb *db;
+        forEachCreatedDb(db) {
+            if (rdbSaveDb(rdb, db->id, rdbflags, rdbver, &key_counter) == -1) goto werr;
         }
     }
 
@@ -1951,6 +1980,79 @@ void rdbRemoveTempFile(pid_t childpid, int from_signal) {
     }
 }
 
+/* Read an unencoded integer, including the full uint64_t range used by stream IDs. */
+static int rdbLoadRedisStreamIdmpLen(rio *rdb, uint64_t *value) {
+    int encoded;
+    if (rdbLoadLenByRef(rdb, &encoded, value) == -1 || encoded) return C_ERR;
+    return C_OK;
+}
+
+/* Redis stream type 26 appends IDMP configuration, producer/IID mappings and
+ * two counters to the type 21 payload. Valkey has no IDMP implementation.
+ * Consume the trailer and report whether any state is discarded. No allocation
+ * is based on the untrusted producer or entry counts. */
+void rdbLogDiscardedRedisStreamIdmp(sds key) {
+    if (server.hide_user_data_from_log) {
+        serverLog(LL_WARNING,
+                  "Discarding Redis stream IDMP state: Valkey does not support "
+                  "idempotent message producers");
+    } else {
+        serverLog(LL_WARNING,
+                  "Discarding Redis stream IDMP state for key '%s': Valkey does not "
+                  "support idempotent message producers",
+                  key);
+    }
+}
+
+static int rdbLoadRedisStreamIdmpString(rio *rdb, bool *allocation_error) {
+    sds value = rdbGenericLoadStringObjectWithError(rdb, RDB_LOAD_SDS, NULL, allocation_error);
+    if (value == NULL) return C_ERR;
+    sdsfree(value);
+    return C_OK;
+}
+
+static int rdbLoadRedisStreamIdmp(rio *rdb, bool *discarded, bool *allocation_error) {
+    uint64_t duration, max_entries, producers, added, duplicates;
+    *discarded = false;
+    *allocation_error = false;
+    if (rdbLoadRedisStreamIdmpLen(rdb, &duration) != C_OK ||
+        rdbLoadRedisStreamIdmpLen(rdb, &max_entries) != C_OK ||
+        rdbLoadRedisStreamIdmpLen(rdb, &producers) != C_OK)
+        return C_ERR;
+    /* Redis 8.6's wire-format limits for IDMP duration and maximum entries. */
+    if (duration < 1 || duration > 86400 || max_entries < 1 || max_entries > 10000)
+        return C_ERR;
+
+    bool has_discarded_state = producers != 0 || duration != 100 || max_entries != 100;
+    while (producers--) {
+        bool string_allocation_error;
+        if (rdbLoadRedisStreamIdmpString(rdb, &string_allocation_error) != C_OK) {
+            *allocation_error = string_allocation_error;
+            return C_ERR;
+        }
+
+        uint64_t entries;
+        if (rdbLoadRedisStreamIdmpLen(rdb, &entries) != C_OK) return C_ERR;
+        while (entries--) {
+            if (rdbLoadRedisStreamIdmpString(rdb, &string_allocation_error) != C_OK) {
+                *allocation_error = string_allocation_error;
+                return C_ERR;
+            }
+
+            uint64_t ms, seq;
+            if (rdbLoadRedisStreamIdmpLen(rdb, &ms) != C_OK ||
+                rdbLoadRedisStreamIdmpLen(rdb, &seq) != C_OK)
+                return C_ERR;
+        }
+    }
+
+    if (rdbLoadRedisStreamIdmpLen(rdb, &added) != C_OK ||
+        rdbLoadRedisStreamIdmpLen(rdb, &duplicates) != C_OK)
+        return C_ERR;
+    *discarded = has_discarded_state || added || duplicates;
+    return C_OK;
+}
+
 /* This function is called by rdbLoadObject() when the code is in RDB-check
  * mode and we find a module value of type 2 that can be parsed without
  * the need of the actual module. The value is parsed for errors, finally
@@ -2173,14 +2275,26 @@ int lpValidateIntegrityAndDups(unsigned char *lp, size_t size, int pairs, int al
 /* Load an Object of the specified type from the specified file.
  * On success a newly allocated object is returned; otherwise, NULL.
  * When the function returns NULL and if 'error' is not NULL, the
- * integer pointed by 'error' is set to the type of error that occurred */
-robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rdbflags, mstime_t now) {
+ * integer pointed by 'error' is set to the type of error that occurred.
+ * Pass the source version in 'foreign_rdbver' for Redis input, or zero to
+ * interpret type numbers in Valkey's namespace. */
+robj *rdbLoadObject(int rdbtype,
+                    int foreign_rdbver,
+                    rio *rdb,
+                    sds key,
+                    int dbid,
+                    int *error,
+                    int rdbflags,
+                    mstime_t now,
+                    bool *idmp_discarded) {
     robj *o = NULL, *ele, *dec;
     uint64_t len;
     unsigned int i;
+    bool redis_stream_v4 = rdbIsSupportedForeignType(foreign_rdbver, rdbtype);
 
     /* Set default error of load object, it will be set to 0 on success. */
     if (error) *error = RDB_LOAD_ERR_OTHER;
+    if (idmp_discarded) *idmp_discarded = false;
 
     if (rdbtype == RDB_TYPE_STRING) {
         /* Read string value */
@@ -2987,7 +3101,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             break;
         }
     } else if (rdbtype == RDB_TYPE_STREAM_LISTPACKS || rdbtype == RDB_TYPE_STREAM_LISTPACKS_2 ||
-               rdbtype == RDB_TYPE_STREAM_LISTPACKS_3) {
+               rdbtype == RDB_TYPE_STREAM_LISTPACKS_3 || redis_stream_v4) {
         o = createStreamObject();
         stream *s = objectGetVal(o);
         uint64_t listpacks = rdbLoadLen(rdb, NULL);
@@ -3306,6 +3420,28 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
                 }
             }
             raxStop(&ri_cg_pel);
+        }
+        if (redis_stream_v4) {
+            bool discarded, allocation_error;
+            if (rdbLoadRedisStreamIdmp(rdb, &discarded, &allocation_error) != C_OK) {
+                if (allocation_error || rioGetReadError(rdb) || rioGetAsyncCloseError(rdb)) {
+                    rdbReportReadError("Redis stream IDMP metadata loading failed");
+                } else {
+                    rdbReportCorruptRDB("Invalid Redis stream IDMP metadata");
+                }
+                decrRefCount(o);
+                return NULL;
+            }
+            if (discarded) {
+                if (idmp_discarded) {
+                    *idmp_discarded = true;
+                } else {
+                    if (rdbCheckMode || rdb_stream_idmp_discarded_count < 10) {
+                        rdbLogDiscardedRedisStreamIdmp(key);
+                    }
+                    if (!rdbCheckMode) rdb_stream_idmp_discarded_count++;
+                }
+            }
         }
     } else if (rdbtype == RDB_TYPE_MODULE_PRE_GA) {
         rdbReportCorruptRDB("Pre-release module format not supported");
@@ -3630,6 +3766,7 @@ int rdbLoadRioWithLoadingCtx(rio *rdb,
 
     rio *prev_rio = server.loading_rio;
     server.loading_rio = rdb;
+    rdb_stream_idmp_discarded_count = 0;
     retval = rdbLoadRioInternal(rdb, rdbflags, rsi, rdb_loading_ctx);
     server.loading_rio = prev_rio;
     if (retval == RDB_OK && streamReaderFinish(&stream_reader) == C_ERR) {
@@ -3781,10 +3918,7 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
         rdb_loading_ctx->functions_lib_ctx = functionsLibCtxGetCurrent();
     }
 
-    if (rdb_loading_ctx->dbarray[0] == NULL) {
-        rdb_loading_ctx->dbarray[0] = createDatabase(0);
-    }
-    serverDb *db = rdb_loading_ctx->dbarray[0];
+    serverDb *db = createDatabaseInArrayIfNeeded(rdb_loading_ctx->dbarray, 0);
 
     /* Key-specific attributes, set by opcodes before the key type. */
     long long lru_idle = -1, lfu_freq = -1, expiretime = -1, now = mstime();
@@ -3797,7 +3931,8 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
         if ((type = rdbLoadType(rdb)) == -1) goto eoferr;
 
         /* Safeguard for unknown foreign opcode interpretations. */
-        if (is_redis_magic && type >= RDB_FOREIGN_TYPE_MIN && type <= RDB_FOREIGN_TYPE_MAX) {
+        if (is_redis_magic && type >= RDB_FOREIGN_TYPE_MIN && type <= RDB_FOREIGN_TYPE_MAX &&
+            !rdbIsSupportedForeignType(rdbver, type)) {
             serverLog(LL_WARNING, "Can't handle foreign type or opcode %d in RDB with version %d",
                       type, rdbver);
             goto loaderr;
@@ -3890,10 +4025,7 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
                           SERVER_TITLE, server.dbnum);
                 exit(1);
             }
-            if (rdb_loading_ctx->dbarray[dbid] == NULL) {
-                rdb_loading_ctx->dbarray[dbid] = createDatabase(dbid);
-            }
-            db = rdb_loading_ctx->dbarray[dbid];
+            db = createDatabaseInArrayIfNeeded(rdb_loading_ctx->dbarray, dbid);
             continue; /* Read next opcode. */
         } else if (type == RDB_OPCODE_RESIZEDB) {
             /* RESIZEDB: Hint about the size of the keys in the currently
@@ -4110,7 +4242,7 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
         /* Read key */
         if ((key = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL)) == NULL) goto eoferr;
         /* Read value */
-        val = rdbLoadObject(type, rdb, key, db->id, &error, rdbflags, now);
+        val = rdbLoadObject(type, is_redis_magic ? rdbver : 0, rdb, key, db->id, &error, rdbflags, now, NULL);
 
         /* Check if the key already expired. This function is used when loading
          * an RDB file from disk, either at startup, or when an RDB was
@@ -4244,6 +4376,11 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
     } else {
         serverLog(LL_NOTICE, "Done loading RDB, keys loaded: %lld, keys expired: %lld, all fields expired hashes: %lld.",
                   server.rdb_last_load_keys_loaded, server.rdb_last_load_keys_expired, rdb_last_load_all_fields_expired);
+    }
+    if (rdb_stream_idmp_discarded_count) {
+        serverLog(LL_NOTICE,
+                  "Done loading RDB, discarded %llu Redis stream IDMP states.",
+                  rdb_stream_idmp_discarded_count);
     }
     ret = RDB_OK;
     goto cleanup;
