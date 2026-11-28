@@ -389,7 +389,7 @@ int rdbEncodeInteger(long long value, unsigned char *enc) {
 /* Loads an integer-encoded object with the specified encoding type "enctype".
  * The returned value changes according to the flags, see
  * rdbGenericLoadStringObject() for more info. */
-void *rdbLoadIntegerObject(rio *rdb, int enctype, int flags, size_t *lenptr) {
+static void *rdbLoadIntegerObject(rio *rdb, int enctype, int flags, size_t *lenptr, bool *allocation_error) {
     int plain = flags & RDB_LOAD_PLAIN;
     int sds = flags & RDB_LOAD_SDS;
     int encode = flags & RDB_LOAD_ENC;
@@ -417,7 +417,15 @@ void *rdbLoadIntegerObject(rio *rdb, int enctype, int flags, size_t *lenptr) {
         char buf[LONG_STR_SIZE], *p;
         int len = ll2string(buf, sizeof(buf), val);
         if (lenptr) *lenptr = len;
-        p = plain ? zmalloc(len) : sdsnewlen(SDS_NOINIT, len);
+        if (allocation_error) {
+            p = plain ? ztrymalloc(len) : sdstrynewlen(SDS_NOINIT, len);
+            if (!p) {
+                *allocation_error = true;
+                return NULL;
+            }
+        } else {
+            p = plain ? zmalloc(len) : sdsnewlen(SDS_NOINIT, len);
+        }
         memcpy(p, buf, len);
         return p;
     } else if (encode) {
@@ -625,16 +633,13 @@ ssize_t rdbSaveStringObject(rio *rdb, robj *obj) {
 static void *rdbGenericLoadStringObjectWithError(rio *rdb,
                                                  int flags,
                                                  size_t *lenptr,
-                                                 bool *allocation_error,
-                                                 bool skip_integer_encoding,
-                                                 bool *integer_encoding_skipped) {
+                                                 bool *allocation_error) {
     int plain = flags & RDB_LOAD_PLAIN;
     int sds = flags & RDB_LOAD_SDS;
     int isencoded;
     unsigned long long len;
 
     if (allocation_error) *allocation_error = false;
-    if (integer_encoding_skipped) *integer_encoding_skipped = false;
     len = rdbLoadLen(rdb, &isencoded);
     if (len == RDB_LENERR) return NULL;
 
@@ -642,16 +647,7 @@ static void *rdbGenericLoadStringObjectWithError(rio *rdb,
         switch (len) {
         case RDB_ENC_INT8:
         case RDB_ENC_INT16:
-        case RDB_ENC_INT32:
-            if (skip_integer_encoding) {
-                unsigned char encoded[4];
-                size_t encoded_len = len == RDB_ENC_INT8 ? 1 : len == RDB_ENC_INT16 ? 2
-                                                                                    : 4;
-                if (rioRead(rdb, encoded, encoded_len) == 0) return NULL;
-                if (integer_encoding_skipped) *integer_encoding_skipped = true;
-                return NULL;
-            }
-            return rdbLoadIntegerObject(rdb, len, flags, lenptr);
+        case RDB_ENC_INT32: return rdbLoadIntegerObject(rdb, len, flags, lenptr, allocation_error);
         case RDB_ENC_LZF: return rdbLoadLzfStringObject(rdb, flags, lenptr, allocation_error);
         default: rdbReportCorruptRDB("Unknown RDB string encoding type %llu", len); return NULL;
         }
@@ -691,7 +687,7 @@ static void *rdbGenericLoadStringObjectWithError(rio *rdb,
 }
 
 void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
-    return rdbGenericLoadStringObjectWithError(rdb, flags, lenptr, NULL, false, NULL);
+    return rdbGenericLoadStringObjectWithError(rdb, flags, lenptr, NULL);
 }
 
 robj *rdbLoadStringObject(rio *rdb) {
@@ -2009,14 +2005,7 @@ void rdbLogDiscardedRedisStreamIdmp(sds key) {
 }
 
 static int rdbLoadRedisStreamIdmpString(rio *rdb, bool *allocation_error) {
-    bool integer_encoding_skipped;
-    sds value = rdbGenericLoadStringObjectWithError(rdb,
-                                                    RDB_LOAD_SDS,
-                                                    NULL,
-                                                    allocation_error,
-                                                    true,
-                                                    &integer_encoding_skipped);
-    if (integer_encoding_skipped) return C_OK;
+    sds value = rdbGenericLoadStringObjectWithError(rdb, RDB_LOAD_SDS, NULL, allocation_error);
     if (value == NULL) return C_ERR;
     sdsfree(value);
     return C_OK;
@@ -2286,8 +2275,11 @@ int lpValidateIntegrityAndDups(unsigned char *lp, size_t size, int pairs, int al
 /* Load an Object of the specified type from the specified file.
  * On success a newly allocated object is returned; otherwise, NULL.
  * When the function returns NULL and if 'error' is not NULL, the
- * integer pointed by 'error' is set to the type of error that occurred */
+ * integer pointed by 'error' is set to the type of error that occurred.
+ * Pass the source version in 'foreign_rdbver' for Redis input, or zero to
+ * interpret type numbers in Valkey's namespace. */
 robj *rdbLoadObject(int rdbtype,
+                    int foreign_rdbver,
                     rio *rdb,
                     sds key,
                     int dbid,
@@ -2298,6 +2290,7 @@ robj *rdbLoadObject(int rdbtype,
     robj *o = NULL, *ele, *dec;
     uint64_t len;
     unsigned int i;
+    bool redis_stream_v4 = rdbIsSupportedForeignType(foreign_rdbver, rdbtype);
 
     /* Set default error of load object, it will be set to 0 on success. */
     if (error) *error = RDB_LOAD_ERR_OTHER;
@@ -3108,7 +3101,7 @@ robj *rdbLoadObject(int rdbtype,
             break;
         }
     } else if (rdbtype == RDB_TYPE_STREAM_LISTPACKS || rdbtype == RDB_TYPE_STREAM_LISTPACKS_2 ||
-               rdbtype == RDB_TYPE_STREAM_LISTPACKS_3 || rdbtype == RDB_TYPE_REDIS_STREAM_LISTPACKS_4) {
+               rdbtype == RDB_TYPE_STREAM_LISTPACKS_3 || redis_stream_v4) {
         o = createStreamObject();
         stream *s = objectGetVal(o);
         uint64_t listpacks = rdbLoadLen(rdb, NULL);
@@ -3428,7 +3421,7 @@ robj *rdbLoadObject(int rdbtype,
             }
             raxStop(&ri_cg_pel);
         }
-        if (rdbtype == RDB_TYPE_REDIS_STREAM_LISTPACKS_4) {
+        if (redis_stream_v4) {
             bool discarded, allocation_error;
             if (rdbLoadRedisStreamIdmp(rdb, &discarded, &allocation_error) != C_OK) {
                 if (allocation_error || rioGetReadError(rdb) || rioGetAsyncCloseError(rdb)) {
@@ -3944,11 +3937,6 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
                       type, rdbver);
             goto loaderr;
         }
-        if (type == RDB_TYPE_REDIS_STREAM_LISTPACKS_4 &&
-            !(is_redis_magic && rdbIsSupportedForeignType(rdbver, type))) {
-            serverLog(LL_WARNING, "Redis stream type %d requires a foreign RDB version", type);
-            goto loaderr;
-        }
 
         /* Inline replication commands run on load. The opcode is honored on any
          * RDB 81 or newer load, but loadCommandFromArgv only runs the embedded command if it is
@@ -4254,7 +4242,7 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
         /* Read key */
         if ((key = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL)) == NULL) goto eoferr;
         /* Read value */
-        val = rdbLoadObject(type, rdb, key, db->id, &error, rdbflags, now, NULL);
+        val = rdbLoadObject(type, is_redis_magic ? rdbver : 0, rdb, key, db->id, &error, rdbflags, now, NULL);
 
         /* Check if the key already expired. This function is used when loading
          * an RDB file from disk, either at startup, or when an RDB was

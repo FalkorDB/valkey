@@ -168,7 +168,9 @@ enum RdbType {
 #define RDB_TYPE_REDIS_STREAM_LISTPACKS_4 26
 
 static inline bool rdbIsSupportedForeignType(int rdbver, int type) {
-    return rdbver == 13 && type == RDB_TYPE_REDIS_STREAM_LISTPACKS_4;
+    /* Redis 8.6, 8.8, 8.10, and 8.12 all read the same type-26 layout. */
+    return (rdbver == 13 || rdbver == 14 || rdbver == 15 || rdbver == 17) &&
+           type == RDB_TYPE_REDIS_STREAM_LISTPACKS_4;
 }
 
 /* Test if a type is an object type. */
@@ -250,6 +252,7 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags);
 ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char type);
 size_t rdbSavedObjectLen(robj *o, robj *key, int dbid);
 robj *rdbLoadObject(int rdbtype,
+                    int foreign_rdbver,
                     rio *rdb,
                     sds key,
                     int dbid,

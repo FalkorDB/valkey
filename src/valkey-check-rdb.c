@@ -568,7 +568,7 @@ void rdbCheckError(const char *fmt, ...) {
     if (rdbstate.key) printf("[additional info] Reading key '%s'\n", (char *)objectGetVal(rdbstate.key));
     if (rdbstate.key_type != -1) {
         const char *name = "unknown";
-        if (rdbstate.key_type == RDB_TYPE_REDIS_STREAM_LISTPACKS_4)
+        if (rdbIsSupportedForeignType(rdbstate.rdbver, rdbstate.key_type))
             name = "redis-stream-v4";
         else if ((unsigned)rdbstate.key_type < sizeof(rdb_type_string) / sizeof(char *))
             name = rdb_type_string[rdbstate.key_type];
@@ -873,7 +873,7 @@ int redis_check_rdb(char *rdbfilename, FILE *fp) {
         rdbstate.doing = RDB_CHECK_DOING_READ_OBJECT_VALUE;
         int error = 0;
         val = rdbLoadObject(
-            type, rdb, objectGetVal(key), selected_dbid, &error, RDBFLAGS_NONE, 0, NULL);
+            type, is_redis_magic ? rdbver : 0, rdb, objectGetVal(key), selected_dbid, &error, RDBFLAGS_NONE, 0, NULL);
         /* Match the server when loading legacy empty containers. */
         if (val == NULL && error != RDB_LOAD_ERR_EMPTY_KEY) goto eoferr;
         if (val && rdbCheckStats) computeDatasetProfile(selected_dbid, key, val, expiretime);

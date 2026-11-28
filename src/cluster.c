@@ -275,6 +275,7 @@ void restoreCommand(client *c) {
 
     bool discarded_idmp = false;
     obj = rdbLoadObject(type,
+                        rdbIsForeignVersion(rdbver) ? rdbver : 0,
                         &payload,
                         objectGetVal(key),
                         c->db->id,
@@ -284,7 +285,7 @@ void restoreCommand(client *c) {
                         &discarded_idmp);
     /* A truncated foreign trailer must not consume the DUMP version/checksum
      * as metadata, nor leave unparsed IDMP state behind. */
-    if (obj && type == RDB_TYPE_REDIS_STREAM_LISTPACKS_4 &&
+    if (obj && rdbIsSupportedForeignType(rdbver, type) &&
         rioTell(&payload) != (off_t)(sdslen(objectGetVal(c->argv[3])) - 10)) {
         decrRefCount(obj);
         obj = NULL;

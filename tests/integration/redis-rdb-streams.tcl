@@ -165,7 +165,7 @@ tags {"rdb stream external:skip"} {
             assert_equal OK [r restore integer-ids 0 "$prefix$trailer$footer"]
             assert_equal [expr {$warnings + 1}] [count_log_message 0 "Discarding Redis stream IDMP state"]
 
-            # Type 26 must never acquire a meaning in Valkey's own namespace.
+            # Do not interpret Valkey type 26 as a Redis stream.
             set native_footer "[binary format cc 81 0][string repeat \x00 8]"
             assert_error "*Bad data format*" {r restore protected 0 "$prefix$trailer$native_footer" replace}
             assert_equal value [r get protected]
@@ -188,6 +188,18 @@ tags {"rdb stream external:skip"} {
             assert_error "*Bad data format*" {r restore version12 0 "$body$footer"}
             assert_equal 0 [r exists version12]
         } {} {needs:debug}
+
+        test {RESTORE accepts the Redis type-26 layout in later verified RDB versions} {
+            test_defer [list r debug set-skip-checksum-validation 0]
+            r debug set-skip-checksum-validation 1
+            set dump [binary format H* [dict get $dumps idmp]]
+            foreach version {14 15 17} {
+                set key "idmp-v$version"
+                set footer "[binary format cc $version 0][string repeat \x00 8]"
+                assert_equal OK [r restore $key 0 "[string range $dump 0 end-10]$footer"]
+                assert_redis_stream_metadata $key [dict get $expected idmp]
+            }
+        } {} {needs:debug}
     }
 
     test {valkey-check-rdb understands Redis RDB 13 streams} {
@@ -195,10 +207,27 @@ tags {"rdb stream external:skip"} {
         assert_match "*RDB looks OK, but loading requires config 'rdb-version-check relaxed'*" $result
     }
 
+    test {Later Redis RDB versions can load and check the same type-26 layout} {
+        set data [read_binary_file tests/assets/redis-8.6-streams.rdb]
+        foreach version {14 15 17} {
+            set path [tmpdir "redis-rdb-v$version"]
+            set filename [file join $path dump.rdb]
+            # Reuse the type-26 fixture with a later header and no checksum.
+            write_binary_file $filename "REDIS[format %04d $version][string range $data 9 end-8][string repeat \x00 8]"
+            set result [exec $::VALKEY_CHECK_RDB_BIN $filename]
+            assert_match "*RDB looks OK, but loading requires config 'rdb-version-check relaxed'*" $result
+            start_server [list overrides [list dir $path rdb-version-check relaxed]] {
+                r select 0
+                assert_redis_stream_metadata idmp [dict get $expected idmp]
+                assert_equal after-streams [r get sentinel]
+            }
+        }
+    }
+
     test {Redis stream type 26 is rejected outside the foreign RDB namespace} {
         set data [read_binary_file tests/assets/redis-8.6-streams.rdb]
         set filename [tmpfile foreign-stream-type.rdb]
-        foreach header {REDIS0011 VALKEY081} {
+        foreach header {REDIS0011 VALKEY013 VALKEY081} {
             write_binary_file $filename "$header[string range $data 9 end]"
             assert_equal 1 [catch {exec $::VALKEY_CHECK_RDB_BIN $filename} result]
             assert_match "*Invalid object type: 26*" $result
